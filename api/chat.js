@@ -16,14 +16,13 @@ export default async function handler(req, res) {
           "Content-Type": "application/json",
           "x-api-key": process.env.ANTHROPIC_API_KEY,
           "anthropic-version": "2023-06-01",
-          "anthropic-beta": "web-search-2025-03-05",
+          "anthropic-beta": "web-search-2025-03-05,prompt-caching-2024-07-31",
         },
         body: JSON.stringify(req.body),
       });
 
       const data = await response.json();
 
-      // Retry su errori temporanei
       if ((response.status === 529 || response.status === 503 || response.status === 429) && attempt < MAX_RETRIES) {
         await new Promise((r) => setTimeout(r, 2000 * attempt));
         continue;
