@@ -149,8 +149,31 @@ function extractJson(text) {
   catch (e) { throw new Error("Risposta incompleta. Riprova. (" + e.message + ")"); }
 }
 
-// ─── ANTHROPIC API ───────────────────────────────────────────
+// ─── ANTHROPIC API con Prompt Caching ────────────────────────
+// Separa la parte statica (istruzioni) da quella dinamica (query)
+// La parte statica viene cachata — risparmio ~70% sui token ripetuti
+function buildCachedMessages(systemPrompt, userQuery) {
+  return [
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: systemPrompt,
+          cache_control: { type: "ephemeral" }, // cachata per 5 minuti
+        },
+        {
+          type: "text",
+          text: userQuery, // parte variabile — non cachata
+        },
+      ],
+    },
+  ];
+}
+
 async function callAPI(messages, maxTok) {
+  // Se il messaggio è già strutturato (array di content), usalo direttamente
+  // Altrimenti lo passa come stringa semplice
   const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -166,49 +189,79 @@ async function callAPI(messages, maxTok) {
   return data.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
 }
 
-// Prompt step 0: disambiguazione — 2 ricerche, max_tokens 500
+// ─── PROMPT CON CACHING ──────────────────────────────────────
+// Parte statica = istruzioni fisse (cachata)
+// Parte dinamica = nome azienda + settore (non cachata)
+
+const DISAMBIG_SYSTEM = (
+  "Sei un motore di identificazione aziendale globale. " +
+  "Ricevi un nome azienda e restituisci i candidati mondiali con match >= 70%. " +
+  "Esegui 2 ricerche web (inglese + lingua locale). " +
+  "Rispondi SOLO con JSON puro, zero testo aggiuntivo, zero backtick. " +
+  'Schema: {"candidati":[{"nome":"","paese":"","citta":"","settore":"","cf_vat":"","tipo":"spa|srl|ltd|inc|gmbh|altro","match_pct":0,"desc_breve":"max 8 parole"}]}. ' +
+  "Max 5 candidati ordinati per match_pct decrescente. Se azienda univoca: 1 solo candidato."
+);
+
+const RISK_SYSTEM = (
+  "Sei un analista senior di due diligence reputazionale globale. " +
+  "Esegui 5 ricerche web in tutte le lingue pertinenti cercando: lawsuit, sanction, investigation, fraud, bankruptcy, data-breach, ESG-violation, governance-issue. " +
+  "Fonti prioritarie: OFAC, EU Sanctions, ONU, SEC, Companies House, Bundesanzeiger, KBIS, AGCM, Garante Privacy, ANAC, stampa internazionale, registri imprese locali. " +
+  "Rispondi SOLO con JSON puro, zero testo, zero backtick. " +
+  'Schema: {"azienda":{"nome":"","identificativo":"n.d.","settore":"","sede":"","paese":""},' +
+  '"confidence":"alta|media|bassa",' +
+  '"dimensioni":[{"id":"LEG","score":0,"sintesi":""},{"id":"FIN","score":0,"sintesi":""},{"id":"MED","score":0,"sintesi":""},{"id":"ESG","score":0,"sintesi":""},{"id":"GOV","score":0,"sintesi":""},{"id":"CYB","score":0,"sintesi":""}],' +
+  '"red_flags":[{"titolo":"","severita":"critica|alta|media|bassa","descrizione":"","fonte":"","data":"","fonti_multiple":false}],' +
+  '"punti_forza":[""],"fonti":[{"titolo":"","url":""}],"nota":""}. ' +
+  "Score 0-100 (100=rischio massimo). Sintesi max 12 parole. Max 5 red_flags, max 7 fonti."
+);
+
+const INVEST_SYSTEM = (
+  "Sei un analista di investment intelligence globale. " +
+  "Esegui 4 ricerche web cercando: nuovi contratti, espansione internazionale, crescita fatturato, partnership, premi, bandi vinti, nuovi prodotti. " +
+  "Rispondi SOLO con JSON puro, zero testo, zero backtick. " +
+  'Schema: {"invest_score":0,"verdict":"acquista|monitora|evita","sintesi":"","trend":"crescita|stabile|declino",' +
+  '"dimensioni_inv":[{"id":"GROWTH","nome":"Crescita ricavi","score":0,"sintesi":""},{"id":"MARKET","nome":"Posizione mercato","score":0,"sintesi":""},{"id":"INNOV","nome":"Innovazione","score":0,"sintesi":""},{"id":"TEAM","nome":"Management","score":0,"sintesi":""},{"id":"RISK_ADJ","nome":"Rischio aggiustato","score":0,"sintesi":""}],' +
+  '"news_positive":[{"titolo":"","sintesi":"","fonte":"","data":"","url":""}],' +
+  '"swot":{"strengths":[""],"weaknesses":[""],"opportunities":[""],"threats":[""]},' +
+  '"fonti_inv":[{"titolo":"","url":""}],"nota_inv":""}. ' +
+  "invest_score 0-100. Sintesi max 12 parole. Max 4 news, max 5 fonti."
+);
+
 function buildDisambiguationPrompt(query, settore) {
-  return (
-    'Identifica aziende mondiali corrispondenti a: "' + query + '"' +
-    (settore ? " settore:" + settore : "") + ". " +
-    "2 ricerche web (inglese + lingua locale). Solo match>=70%. JSON puro: " +
-    '{"candidati":[{"nome":"","paese":"","citta":"","settore":"","cf_vat":"","tipo":"spa|srl|ltd|inc|gmbh|altro","match_pct":0,"desc_breve":"max 8 parole"}]}. ' +
-    "Max 5 candidati, decrescente. Se azienda univoca: 1 solo."
-  );
+  // Sistema cachato + query dinamica
+  return [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: DISAMBIG_SYSTEM, cache_control: { type: "ephemeral" } },
+        { type: "text", text: 'Azienda da identificare: "' + query + '"' + (settore ? " settore: " + settore : "") },
+      ],
+    },
+  ];
 }
 
-// Prompt rischio: 5 ricerche web approfondite, fonti globali
 function buildRiskPrompt(query, settore) {
-  return (
-    'Due diligence reputazionale GLOBALE su: "' + query + '"' +
-    (settore ? " settore:" + settore : "") + ". " +
-    "5 ricerche web in tutte le lingue pertinenti: lawsuit/sanction/investigation/fraud/bankruptcy/data-breach/ESG-violation/governance. " +
-    "Fonti: OFAC, EU Sanctions, ONU, SEC, Companies House, Bundesanzeiger, KBIS, AGCM, Garante, ANAC, stampa internazionale, registri imprese locali. " +
-    "JSON puro: " +
-    '{"azienda":{"nome":"","identificativo":"n.d.","settore":"","sede":"","paese":""},' +
-    '"confidence":"alta|media|bassa",' +
-    '"dimensioni":[{"id":"LEG","score":0,"sintesi":""},{"id":"FIN","score":0,"sintesi":""},{"id":"MED","score":0,"sintesi":""},{"id":"ESG","score":0,"sintesi":""},{"id":"GOV","score":0,"sintesi":""},{"id":"CYB","score":0,"sintesi":""}],' +
-    '"red_flags":[{"titolo":"","severita":"critica|alta|media|bassa","descrizione":"","fonte":"","data":"","fonti_multiple":false}],' +
-    '"punti_forza":[""],"fonti":[{"titolo":"","url":""}],"nota":""}. ' +
-    "Score 0-100. Sintesi max 12 parole. Max 5 red_flags, max 7 fonti."
-  );
+  return [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: RISK_SYSTEM, cache_control: { type: "ephemeral" } },
+        { type: "text", text: 'Analizza: "' + query + '"' + (settore ? " settore: " + settore : "") },
+      ],
+    },
+  ];
 }
 
-// Prompt potenzialità: 4 ricerche web approfondite
 function buildInvestPrompt(query, riskScore, settore) {
-  return (
-    'Investment intelligence GLOBALE su: "' + query + '"' +
-    (settore ? " settore:" + settore : "") + ". " +
-    "Risk score noto:" + riskScore + "/100. " +
-    "4 ricerche web: nuovi contratti, espansione internazionale, fatturato/crescita, partnership/premi/bandi vinti, pipeline prodotti. " +
-    "JSON puro: " +
-    '{"invest_score":0,"verdict":"acquista|monitora|evita","sintesi":"","trend":"crescita|stabile|declino",' +
-    '"dimensioni_inv":[{"id":"GROWTH","nome":"Crescita ricavi","score":0,"sintesi":""},{"id":"MARKET","nome":"Posizione mercato","score":0,"sintesi":""},{"id":"INNOV","nome":"Innovazione","score":0,"sintesi":""},{"id":"TEAM","nome":"Management","score":0,"sintesi":""},{"id":"RISK_ADJ","nome":"Rischio aggiustato","score":0,"sintesi":""}],' +
-    '"news_positive":[{"titolo":"","sintesi":"","fonte":"","data":"","url":""}],' +
-    '"swot":{"strengths":[""],"weaknesses":[""],"opportunities":[""],"threats":[""]},' +
-    '"fonti_inv":[{"titolo":"","url":""}],"nota_inv":""}. ' +
-    "invest_score 0-100. Sintesi max 12 parole. Max 4 news, max 5 fonti."
-  );
+  return [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: INVEST_SYSTEM, cache_control: { type: "ephemeral" } },
+        { type: "text", text: 'Analizza potenzialita: "' + query + '"' + (settore ? " settore: " + settore : "") + ". Risk score reputazionale noto: " + riskScore + "/100." },
+      ],
+    },
+  ];
 }
 
 // ─── UI ATOMS ────────────────────────────────────────────────
