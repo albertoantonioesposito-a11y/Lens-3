@@ -123,44 +123,47 @@ function repairJson(str) {
 }
 
 function extractJson(text) {
-  const clean = text.replace(/```json|```/g, "").trim();
+  // Rimuove markdown, testo prima/dopo il JSON
+  let clean = text
+    .replace(/```json/gi, "")
+    .replace(/```/g, "")
+    .trim();
+  // Trova il primo { e l'ultimo } bilanciato
   const a = clean.indexOf("{");
-  if (a === -1) throw new Error("Risposta non valida");
-  const b = clean.lastIndexOf("}");
-  if (b !== -1) { try { return JSON.parse(clean.slice(a, b + 1)); } catch (_) {} }
-  try { return JSON.parse(repairJson(clean.slice(a))); }
+  if (a === -1) throw new Error("Risposta non valida dal modello");
+  // Cerca la } che bilancia la prima {
+  let depth = 0, end = -1;
+  let inStr = false, esc = false;
+  for (let i = a; i < clean.length; i++) {
+    const ch = clean[i];
+    if (esc) { esc = false; continue; }
+    if (ch === "\\" && inStr) { esc = true; continue; }
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (ch === "{") depth++;
+    if (ch === "}") { depth--; if (depth === 0) { end = i; break; } }
+  }
+  const candidate = end !== -1 ? clean.slice(a, end + 1) : clean.slice(a);
+  try { return JSON.parse(candidate); } catch (_) {}
+  try { return JSON.parse(repairJson(candidate)); }
   catch (e) { throw new Error("Risposta incompleta. Riprova. (" + e.message + ")"); }
 }
 
-// ─── GEMINI API ──────────────────────────────────────────────
-function toGeminiContents(messages) {
-  return messages.map((m) => ({
-    role: m.role === "assistant" ? "model" : "user",
-    parts: [{ text: m.content }],
-  }));
-}
-
-function extractGeminiText(data) {
-  if (data.error) throw new Error(data.error.message || "Errore Gemini API");
-  const parts = data.candidates?.[0]?.content?.parts || [];
-  return parts.filter((p) => p.text).map((p) => p.text).join("\n");
-}
-
+// ─── ANTHROPIC API ───────────────────────────────────────────
 async function callAPI(messages, maxTok) {
   const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      contents: toGeminiContents(messages),
-      tools: [{ googleSearch: {} }],
-      generationConfig: {
-        maxOutputTokens: maxTok || 2500,
-        temperature: 0.1,
-      },
+      model: "claude-sonnet-4-6",
+      max_tokens: maxTok || 2500,
+      messages,
+      tools: [{ type: "web_search_20250305", name: "web_search" }],
     }),
   });
   const data = await res.json();
-  return extractGeminiText(data);
+  if (data.error) throw new Error(data.error.message || "Errore API");
+  return data.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
 }
 
 // Prompt step 0: disambiguazione — 2 ricerche, max_tokens 500
