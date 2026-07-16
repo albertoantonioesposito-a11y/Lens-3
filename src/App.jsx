@@ -150,43 +150,26 @@ function extractJson(text) {
 }
 
 // ─── ANTHROPIC API con Prompt Caching ────────────────────────
-// Separa la parte statica (istruzioni) da quella dinamica (query)
-// La parte statica viene cachata — risparmio ~70% sui token ripetuti
-function buildCachedMessages(systemPrompt, userQuery) {
-  return [
-    {
-      role: "user",
-      content: [
-        {
-          type: "text",
-          text: systemPrompt,
-          cache_control: { type: "ephemeral" }, // cachata per 5 minuti
-        },
-        {
-          type: "text",
-          text: userQuery, // parte variabile — non cachata
-        },
-      ],
-    },
-  ];
-}
-
 async function callAPI(messages, maxTok) {
-  // Se il messaggio è già strutturato (array di content), usalo direttamente
-  // Altrimenti lo passa come stringa semplice
+  // I messaggi arrivano già nel formato corretto con cache_control
   const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
       max_tokens: maxTok || 2500,
-      messages,
+      messages: messages,
       tools: [{ type: "web_search_20250305", name: "web_search" }],
     }),
   });
   const data = await res.json();
   if (data.error) throw new Error(data.error.message || "Errore API");
   return data.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+}
+
+// Helper per messaggi semplici (Q&A analista)
+function simpleMessage(text) {
+  return [{ role: "user", content: text }];
 }
 
 // ─── PROMPT CON CACHING ──────────────────────────────────────
@@ -750,7 +733,7 @@ function LensApp() {
     if (!query.trim() || stato === "loading" || stato === "disambiguating") return;
     setStato("disambiguating"); setReport(null); setInvReport(null); setQa([]); setErrore(""); setCopiato(false); setTab("rischio"); setCandidati([]);
     try {
-      const dText = await callAPI([{ role: "user", content: buildDisambiguationPrompt(query.trim(), settore.trim()) }], 500);
+      const dText = await callAPI(buildDisambiguationPrompt(query.trim(), settore.trim()), 500);
       const dJson = extractJson(dText);
       const lista = (dJson.candidati || []).filter((c) => (c.match_pct || 0) >= 70);
       if (lista.length <= 1) {
@@ -773,8 +756,8 @@ function LensApp() {
     try {
       // Lancia entrambe le chiamate in parallelo
       const [riskText, invText] = await Promise.all([
-        callAPI([{ role: "user", content: buildRiskPrompt(target, settore.trim()) }], 2500),
-        callAPI([{ role: "user", content: buildInvestPrompt(target, 50, settore.trim()) }], 2000),
+        callAPI(buildRiskPrompt(target, settore.trim()), 2500),
+        callAPI(buildInvestPrompt(target, 50, settore.trim()), 2000),
       ]);
       const riskJson = extractJson(riskText);
       const invJson  = extractJson(invText);
@@ -801,7 +784,7 @@ function LensApp() {
     setQaLoading(true); setFollowUp("");
     try {
       const ctx = "Contesto: report su " + (report.azienda?.nome || "") + ", score rischio " + composito + "/100, invest " + (invReport?.invest_score || "n.d.") + "/100. Rispondi in max 120 parole, in italiano. Domanda: " + domanda;
-      const risposta = await callAPI([{ role: "user", content: ctx }]);
+      const risposta = await callAPI(simpleMessage(ctx));
       setQa((prev) => [...prev, { d: domanda, r: risposta }]);
     } catch (e) {
       setQa((prev) => [...prev, { d: domanda, r: "Errore: " + e.message }]);
